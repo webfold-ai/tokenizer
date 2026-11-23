@@ -10,3 +10,5 @@ apeiron = { git = "https://github.com/webfold-ai/apeiron", rev = "09aa02b0582589
 
 [lints.rust]
 missing_docs = "warn"
+
+[workspace]
