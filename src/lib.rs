@@ -1,19 +1,8 @@
-//! `tokenizer` — the native B/U accumulator n-gram counter.
+//! A tokenizer that is a fold.
 //!
-//! Recovered **verbatim** from bedrock's git history (`src/model/tokenizer.rs` at `ecd714f^`), the
-//! day bedrock extracted `model/{seed,tokenizer}.rs` to standalone repos — a move that was
-//! prepared ("verified building standalone before push") but **never pushed**: `Ptyktos/tokenizer`
-//! does not exist on GitHub or on the GitLab mirror, so this crate was orphaned along with every
-//! workspace that referenced it.
-//!
-//! The only change from the recovered source is the table's home: `crate::sangdb::Store` — the
-//! store face as it was named in September — is now `apeiron::map::hashtrinity::Table`, the
-//! in-tree port of the same primitive that the rest of the stack moved to. The API is the same
-//! (`new`, `get`, `put`, `insert_with`, `iter`), so the body is unchanged.
-//!
-//! The `Seed` half of that extraction is alive at [`webfold-ai/seed-format`](https://github.com/webfold-ai/seed-format).
-//!
-//! Zero dependencies beyond the table, no derive macro, no unsafe.
+//! Text in, token ids out, ids back to text — and the whole thing is one n-gram counter over a
+//! hash table. There is no `tokenizer.json`, no merge ranks, no oniguruma regex and no unsafe: the
+//! cost per token is a fixed number of table probes, and the memory is the table.
 //!
 //! ```
 //! use tokenizer::Tokenizer;
@@ -22,17 +11,37 @@
 //! tok.train("the quick brown fox");
 //! assert_eq!(tok.decode(&tok.encode("the quick brown fox")), "the quick brown fox");
 //! ```
+//!
+//! # The four faces
+//!
+//! | face | what it holds | operation |
+//! |---|---|---|
+//! | **Set** | the vocabulary: which tokens exist | `mark` |
+//! | **Map** | token ↔ id | `put` (last write wins) |
+//! | **Count** | the n-gram counter: context → next-token counts | `add` (the accumulator) |
+//! | **self** | encode and decode | the fold turned on itself |
+//!
+//! Encoding folds the byte stream into contexts the counter has seen; decoding folds the ids back
+//! out. Because the counter is the model, there is no separate training phase beyond counting a
+//! corpus.
+//!
+//! # What it is not
+//!
+//! Not a drop-in for a pretrained model's tokenizer: the vocabulary is whatever your corpus
+//! produced, so ids do not line up with anyone else's. Not a subword segmenter with merges, and not
+//! async, streaming or `no_std`. It is a table and a loop.
+//!
+//! # Guarantees
+//!
+//! - `#![forbid(unsafe_code)]`, and `missing_docs` is denied.
+//! - One dependency: [`apeiron`], for the table and its coordinate arithmetic.
+//! - `encode` then `decode` returns the input for any input the tokenizer has been trained on,
+//!   including input that ends mid-character.
+//! - No network, no files, no processes, no telemetry.
+//!
+//! [`apeiron`]: https://github.com/webfold-ai/apeiron
 
-//!
-//! Replaces `tokenizers::Tokenizer` (HuggingFace). The tokenizer IS the B/U accumulator:
-//! the n-gram counter (`context → next-token count`) proved to beat a 1.71M-param torch GPT
-//! (`theory/MODEL_MEASUREMENTS.md`). One fold, O(1) per token, no Python, no oniguruuma regex.
-//!
-//! ## The HashTrinity face
-//! - **NB/Set** = the vocabulary (which tokens exist — `mark` on the Set face)
-//! - **B/Map** = the token ↔ id map (`put` on the Map face — last write wins)
-//! - **B/U** = the n-gram counter (`add` on the Count face — the accumulator)
-//! - **self** = the encode/decode (the fold turned on itself — byte stream ↔ token stream)
+#![forbid(unsafe_code)]
 
 use apeiron::map::hashtrinity::Table as Store;
 // TokenId = u32 already implements the coordinate trait (via the int_monoid macro).
@@ -40,14 +49,14 @@ use apeiron::map::hashtrinity::Table as Store;
 /// A token: either a byte, a byte pair (BPE merge), or a word piece.
 pub type TokenId = u32;
 
-/// The tokenizer — a vocabulary (Set/Map) + an n-gram counter (the B/U accumulator).
+/// The tokenizer — a vocabulary (`Set`/`Map`) plus an n-gram counter (the `B/U` accumulator).
 pub struct Tokenizer {
     /// token string → token id (the B/Map face)
     vocab: Store<String, TokenId>,
     /// token id → token string (the inverse map)
     inv_vocab: Vec<String>,
-    /// n-gram counter: (context_hash → token_id → count) — the B/U accumulator face
-    /// context_hash is a rolling hash of the last N tokens
+    /// n-gram counter: (`context_hash` → `token_id` → count) — the `B/U` accumulator face
+    /// `context_hash` is a rolling hash of the last N tokens
     counts: Store<u64, Store<TokenId, u64>>,
     /// The n-gram order (context length)
     order: usize,
@@ -72,33 +81,43 @@ impl Tokenizer {
             self.add_byte(*b);
         }
         let tokens = self.encode_raw(text);
-        let mut context_hash: u64 = 0;
-        for (i, &tok) in tokens.iter().enumerate() {
-            if i >= self.order {
-                // Add to the n-gram counter: (context_hash, tok) → count + 1
-                let context_table = self.counts.get(&context_hash);
-                if let Some(table) = context_table {
+        for i in self.order..tokens.len() {
+            // The counter is keyed by the LAST `order` tokens, through the same
+            // `context_hash` the public API exposes. Keying it by a rolling hash of the whole
+            // prefix (what this did before) makes every key unique to its position, so
+            // `predict`/`distribution` could never be reached through the documented API.
+            let context_hash = self.context_hash(&tokens[i - self.order..i]);
+            let tok = tokens[i];
+            match self.counts.get(&context_hash) {
+                Some(table) => {
                     let mut t = table.clone();
                     t.insert_with(tok, 1, |old, new| old + new);
                     self.counts.put(context_hash, t);
-                } else {
+                }
+                None => {
                     let mut t: Store<TokenId, u64> = Store::new();
                     t.put(tok, 1);
                     self.counts.put(context_hash, t);
                 }
             }
-            // Rolling context hash (FNV-1a)
-            context_hash = update_context_hash(context_hash, tok, self.order);
         }
     }
 
-    /// Encode text to token IDs. For a trained tokenizer, uses BPE merges.
-    /// For an untrained one, falls back to byte-level tokenization.
+    /// Whether `token` is in the vocabulary (the `Set` face).
+    #[must_use]
+    pub fn contains(&self, token: &str) -> bool {
+        self.vocab.get(&token.to_string()).is_some()
+    }
+
+    /// Encode text to token ids. For a trained tokenizer, uses BPE merges; for an untrained one,
+    /// falls back to byte-level tokenization.
+    #[must_use]
     pub fn encode(&self, text: &str) -> Vec<TokenId> {
         self.encode_raw(text)
     }
 
     /// Decode token IDs back to text.
+    #[must_use]
     pub fn decode(&self, ids: &[TokenId]) -> String {
         let mut bytes = Vec::with_capacity(ids.len());
         for &id in ids {
@@ -113,6 +132,7 @@ impl Tokenizer {
     }
 
     /// Vocabulary size.
+    #[must_use]
     pub fn vocab_size(&self) -> usize {
         self.inv_vocab.len()
     }
@@ -175,7 +195,11 @@ impl Tokenizer {
     }
 
     /// Add a token to the vocabulary.
-    fn add_token(&mut self, token: String) -> TokenId {
+    /// Add `token` to the vocabulary (the Set face's `mark`), returning its id.
+    ///
+    /// Idempotent: a token already present keeps its id. This is the entry point a caller uses to
+    /// extend a trained vocabulary with tokens it knows it will need.
+    pub fn add_token(&mut self, token: String) -> TokenId {
         if let Some(&id) = self.vocab.get(&token) {
             return id;
         }
@@ -189,7 +213,7 @@ impl Tokenizer {
 /// FNV-1a-based rolling context hash.
 fn update_context_hash(mut hash: u64, token: TokenId, _order: usize) -> u64 {
     hash ^= token as u64;
-    hash = hash.wrapping_mul(0x100000001b3);
+    hash = hash.wrapping_mul(0x0100_0000_01b3);
     hash
 }
 
@@ -220,8 +244,26 @@ mod tests {
         tok.train("hello hello hello hello");
         // The counter should predict the most frequent continuation
         let dist = tok.distribution(tok.context_hash(&[b'h' as u32, b'e' as u32]));
-        // Should have a non-empty distribution
-        assert!(!dist.is_empty() || true); // may be empty if order doesn't match
+        // Mutation that turns this red: return an empty distribution for a context the corpus
+        // contains (the previous assertion here was `!dist.is_empty() || true`, which is always
+        // true and asserted nothing).
+        assert!(
+            !dist.is_empty(),
+            "a trained context must have a distribution"
+        );
+        let total: f64 = dist.iter().map(|(_, p)| *p).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-9,
+            "the distribution must be normalised, got {total}"
+        );
+        let top = dist
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("non-empty");
+        assert_eq!(
+            top.0, b'l' as u32,
+            "after \"he\" the most likely byte is 'l'"
+        );
     }
 
     #[test]
