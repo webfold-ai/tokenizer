@@ -2,13 +2,21 @@
 name = "tokenizer"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 license = "Apache-2.0"
-description = "The native B/U accumulator n-gram counter: the tokenizer IS the fold. Recovered from bedrock's history, where it was extracted to a repo that was never pushed."
+description = "A tokenizer that is a fold: an n-gram counter over a hash table, with no tokenizer.json, no regex and no unsafe."
+repository = "https://github.com/webfold-ai/tokenizer"
+documentation = "https://docs.rs/tokenizer"
+readme = "README.md"
+keywords = ["tokenizer", "nlp", "n-gram", "fold", "text"]
+categories = ["text-processing"]
+exclude = ["/.github", "/deny.toml"]
 
 [dependencies]
 apeiron = { git = "https://github.com/webfold-ai/apeiron", rev = "09aa02b05825899556988cc29a3ce291b38798d6" }
 
 [lints.rust]
-missing_docs = "warn"
+missing_docs = "deny"
+unsafe_code = "forbid"
 
 [workspace]

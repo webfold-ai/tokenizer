@@ -1,0 +1,7 @@
+tokenizer
+Copyright 2026 webfold-ai
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+It depends on apeiron (https://github.com/webfold-ai/apeiron), also Apache-2.0, for the hash table
+and its coordinate arithmetic. No third-party source is vendored into this repository.
