@@ -12,6 +12,15 @@
 //! assert_eq!(tok.decode(&tok.encode("the quick brown fox")), "the quick brown fox");
 //! ```
 //!
+//! # The artifact reader
+//!
+//! [`artifact`] is the other job a tokenizer has: reading a **foreign** tokenizer - a HuggingFace
+//! `tokenizer.json` (byte-level BPE, cl100k-style `Split`, or SentencePiece/Llama with byte
+//! fallback) or a GGUF tokenizer - lifted through `wirefold`'s JSON parser rather than hand-scanned.
+//! It is a different object from the count fold above: the fold is *our* model's vocabulary, learned
+//! by counting; the artifact is *someone else's* vocabulary, read as data. They live in one crate
+//! because both answer "text to ids", and they stay two types because they are not the same law.
+//!
 //! # The four faces
 //!
 //! | face | what it holds | operation |
@@ -277,3 +286,6 @@ mod tests {
         }
     }
 }
+
+#[allow(missing_docs)] // a moved reader: its API is the artifact's, documented in `artifact.rs`
+pub mod artifact;
